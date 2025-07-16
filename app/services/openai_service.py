@@ -1,0 +1,139 @@
+import openai
+import logging
+import json
+from typing import Optional, Dict, Any
+from app.core.config import settings
+from app.schemas.openai import OpenAIResponse
+
+logger = logging.getLogger(__name__)
+
+
+class OpenAIService:
+    def __init__(self):
+        self.client = openai.OpenAI(api_key=settings.openai_api_key)
+        self.model = settings.openai_model
+
+    async def analyze_code_diff(self, diff_content: str, pr_title: str, pr_description: str = "") -> Optional[OpenAIResponse]:
+        """Analyze code diff and provide review feedback"""
+        
+        prompt = self._create_review_prompt(diff_content, pr_title, pr_description)
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert code reviewer. Analyze the provided git diff and provide constructive feedback."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                max_tokens=1000,
+                temperature=0.3
+            )
+            
+            review_text = response.choices[0].message.content
+            return self._parse_review_response(review_text)
+            
+        except Exception as e:
+            logger.error(f"OpenAI API error: {e}")
+            return None
+
+    def _create_review_prompt(self, diff_content: str, pr_title: str, pr_description: str) -> str:
+        """Create a structured prompt for code review"""
+        prompt = f"""
+Please review the following pull request:
+
+**Title:** {pr_title}
+**Description:** {pr_description}
+
+**Code Changes:**
+```diff
+{diff_content}
+```
+
+Please provide a code review focusing on:
+1. Code quality and best practices
+2. Potential bugs or security issues
+3. Performance considerations
+4. Code maintainability and readability
+5. Test coverage (if applicable)
+
+Format your response as a JSON object with the following structure:
+{{
+    "review_summary": "Brief overall assessment of the changes",
+    "suggestions": ["List of specific suggestions for improvement"],
+    "severity": "low|medium|high",
+    "requires_changes": true/false
+}}
+
+Keep suggestions constructive and specific. Focus on significant issues rather than minor style preferences.
+"""
+        return prompt
+
+    def _parse_review_response(self, response_text: str) -> OpenAIResponse:
+        """Parse the OpenAI response into structured format"""
+        try:
+            # Try to extract JSON from the response
+            start_idx = response_text.find('{')
+            end_idx = response_text.rfind('}') + 1
+            
+            if start_idx != -1 and end_idx != -1:
+                json_str = response_text[start_idx:end_idx]
+                parsed_response = json.loads(json_str)
+                
+                return OpenAIResponse(
+                    review_summary=parsed_response.get("review_summary", ""),
+                    suggestions=parsed_response.get("suggestions", []),
+                    severity=parsed_response.get("severity", "medium"),
+                    requires_changes=parsed_response.get("requires_changes", False)
+                )
+            else:
+                # Fallback if JSON parsing fails
+                return OpenAIResponse(
+                    review_summary=response_text,
+                    suggestions=[],
+                    severity="medium",
+                    requires_changes=False
+                )
+                
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse OpenAI response as JSON, using fallback")
+            return OpenAIResponse(
+                review_summary=response_text,
+                suggestions=[],
+                severity="medium",
+                requires_changes=False
+            )
+
+    def format_review_comment(self, review: OpenAIResponse) -> str:
+        """Format the review into a GitHub comment"""
+        severity_emoji = {
+            "low": "✅",
+            "medium": "⚠️",
+            "high": "🚨"
+        }
+        
+        comment = f"""## 🤖 AI Code Review {severity_emoji.get(review.severity, '⚠️')}
+
+**Summary:** {review.review_summary}
+
+"""
+        
+        if review.suggestions:
+            comment += "### 📝 Suggestions:\n"
+            for i, suggestion in enumerate(review.suggestions, 1):
+                comment += f"{i}. {suggestion}\n"
+            comment += "\n"
+        
+        if review.requires_changes:
+            comment += "### ⚠️ Action Required\nThis PR may need changes before merging.\n\n"
+        else:
+            comment += "### ✅ Overall Assessment\nThis PR looks good to merge!\n\n"
+        
+        comment += "*This review was generated by AI. Please use your judgment and consider the suggestions as guidance.*"
+        
+        return comment
